@@ -72,6 +72,11 @@ def _resolve_tag(args, cfg: dict) -> tuple[str, str]:
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--workspace", required=True, help="Modal workspace(modal.com 个人主页那段,如 your-workspace)")
     ap.add_argument("--token-id", default=os.environ.get("MODAL_TOKEN_ID", ""), help="ak-...")
@@ -146,7 +151,7 @@ def main():
     cfg["modal_app_name"] = app_name
     cfg["comfyui_tag"] = tag
     cfg.setdefault("modal_volume_name", "comfyui-bridge-models")
-    cfg.setdefault("scaledown_window", 12)
+    cfg.setdefault("scaledown_window", 2)
     if args.token_id:
         cfg["modal_token_id"] = args.token_id
     if args.token_secret:

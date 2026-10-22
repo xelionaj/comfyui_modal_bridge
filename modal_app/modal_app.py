@@ -66,8 +66,12 @@ try:
     bridge_secret = modal.Secret.from_name(SECRET_NAME)
 except Exception:
     bridge_secret = modal.Secret.from_dict({})
+# The downloader can use a separate Civitai Secret owned by the account. Keep it
+# separate from the bridge-managed Secret so deployment does not overwrite it.
+civitai_secret = modal.Secret.from_name("civitai")
 
 job_state = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
+model_download_state = modal.Dict.from_name(f"{APP_NAME}-model-downloads", create_if_missing=True)
 
 # job_state 清理:每条 completed 含整张图 base64,不清会让 Dict 无限膨胀。
 # 策略:终态(completed/failed/cancelled)条目超过 JOB_TTL_S 就删;再按数量上限兜底。
@@ -1095,11 +1099,11 @@ def _worker_entry(self, workflow: dict, job_id: str, input_images: list | None,
 # 每档带 Modal 原生 fallback(排不到主卡自动降级到链里下一个)。
 _PRIMARY_GPU = os.environ.get("MODAL_BRIDGE_DEFAULT_GPU", "H100")
 _GPU_CHAIN = {
-    "B200":      ["B200", "H200", "H100"], # 180G Blackwell 最强档,排不到降 H200/H100
-    "H100":      ["H100", "A100-80GB"],   # 主卡排不到降 A100-80G
-    "H200":      ["H200", "H100"],         # 141G 大卡,降级到 H100
-    "A100-80GB": ["A100-80GB"],
-    "L40S":      ["L40S"],                  # 选 L40S 是为省钱,不 fallback 到贵卡
+    "B300": ["B300"], "B200": ["B200", "H200", "H100!"],
+    "H200": ["H200", "H100!"], "H100!": ["H100!", "A100-80GB"], "H100": ["H100", "A100-80GB"],
+    "RTX-PRO-6000": ["RTX-PRO-6000"], "A100-80GB": ["A100-80GB"],
+    "A100-40GB": ["A100-40GB"], "L40S": ["L40S"], "A10": ["A10"],
+    "L4": ["L4"], "T4": ["T4"],
 }
 _GPU_LIST = _GPU_CHAIN.get(_PRIMARY_GPU, [_PRIMARY_GPU])
 
@@ -1266,7 +1270,7 @@ def _check(key: str):
 # _sweep_job_state 要调 models_vol.remove_file() 清 _outputs/,没被引用的全局 Volume 对象
 # 在容器内可能未初始化,那样 GC 会永远静默失败(而日志上看不出来)。挂载本身是 lazy 的,
 # 不读文件就没有实际开销。
-@app.function(image=cuda_image, secrets=[bridge_secret], timeout=60,
+@app.function(image=cuda_image, secrets=[bridge_secret], timeout=60, scaledown_window=SCALEDOWN,
               volumes={"/comfy-volume": models_vol})
 @modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-run")
 def run_endpoint(payload: dict):
@@ -1375,7 +1379,7 @@ def run_endpoint(payload: dict):
     return {"id": job_id, "status": "queued", "gpu": gpu_display}
 
 
-@app.function(image=cuda_image, secrets=[bridge_secret], timeout=10)
+@app.function(image=cuda_image, secrets=[bridge_secret], timeout=10, scaledown_window=SCALEDOWN)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-status")
 def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header("")):
     deny = _check(x_bridge_key or key)
@@ -1417,7 +1421,7 @@ def status_endpoint(job_id: str, key: str = "", x_bridge_key: str = _Header(""))
 
 
 @app.function(image=cuda_image, volumes={"/comfy-volume": models_vol},
-              secrets=[bridge_secret], timeout=300)
+              secrets=[bridge_secret], timeout=300, scaledown_window=SCALEDOWN)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-fetch")
 def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0, ack: int = 0,
                    x_bridge_key: str = _Header("")):
@@ -1455,6 +1459,230 @@ def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0, ack: 
     return FileResponse(str(local), filename=Path(path).name)
 
 
+def _download_state_update(download_id: str, **values) -> None:
+    cur = model_download_state.get(download_id) or {}
+    model_download_state[download_id] = {**cur, **values, "updated_at": time.time()}
+
+
+@app.function(image=cuda_image, volumes={"/comfy-volume": models_vol},
+              secrets=[bridge_secret, civitai_secret], timeout=21600, max_containers=1,
+              scaledown_window=SCALEDOWN)
+@modal.concurrent(max_inputs=1)
+def model_download_job(url: str, provider: str, model_type: str, filename: str,
+                       overwrite: bool, download_id: str):
+    """Download a model in the cloud and persist it to the shared Modal Volume."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
+    from ipaddress import ip_address
+    import requests
+
+    part = None
+    response = None
+    try:
+        _download_state_update(download_id, status="downloading", message=f"Starting {provider} download…",
+                               downloaded_bytes=0, total_bytes=0)
+        models_vol.reload()
+        base = Path("/comfy-volume/models").resolve()
+        dest_dir = (base / model_type).resolve()
+        if not dest_dir.is_relative_to(base):
+            raise RuntimeError("Invalid model folder.")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        headers = {"User-Agent": "comfyui-modal-bridge/0.8"}
+        if provider == "Hugging Face" and os.environ.get("HF_TOKEN"):
+            headers["Authorization"] = "Bearer " + os.environ["HF_TOKEN"]
+        elif provider == "Civitai":
+            civitai_token = (os.environ.get("CIVITAI_API_TOKEN")
+                             or os.environ.get("CIVITAI_TOKEN", ""))
+            if civitai_token:
+                headers["Authorization"] = "Bearer " + civitai_token
+
+        # Civitai returns a signed CDN URL; never forward its API token to that host.
+        current = url
+        for _ in range(6):
+            response = requests.get(current, headers=headers, stream=True, allow_redirects=False, timeout=(20, 120))
+            # Civitai documents Bearer auth, but some download links only honor
+            # ?token=. Retry the provider URL once with that form on 401, while
+            # keeping the token off any signed CDN redirect.
+            civitai_token = ((os.environ.get("CIVITAI_API_TOKEN")
+                              or os.environ.get("CIVITAI_TOKEN", ""))
+                             if provider == "Civitai" else "")
+            if response.status_code == 401 and civitai_token and current == url:
+                response.close()
+                parts = urlsplit(url)
+                query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                         if k.lower() != "token"]
+                query.append(("token", civitai_token))
+                token_url = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                        urlencode(query), parts.fragment))
+                response = requests.get(token_url, headers=headers, stream=True,
+                                        allow_redirects=False, timeout=(20, 120))
+            if response.status_code not in (301, 302, 303, 307, 308):
+                break
+            location = response.headers.get("Location")
+            response.close()
+            response = None
+            if not location:
+                raise RuntimeError("Provider redirect had no download location.")
+            nxt = requests.compat.urljoin(current, location)
+            next_url = urlsplit(nxt)
+            if next_url.scheme != "https" or not next_url.hostname:
+                raise RuntimeError("Provider returned an insecure download redirect.")
+            redirect_host = next_url.hostname.lower()
+            try:
+                if not ip_address(redirect_host).is_global:
+                    raise RuntimeError("Provider returned a non-public download redirect.")
+            except ValueError:
+                if redirect_host == "localhost" or redirect_host.endswith((".localhost", ".local", ".internal")):
+                    raise RuntimeError("Provider returned a non-public download redirect.")
+            if provider == "Civitai" or next_url.hostname.lower() != "huggingface.co":
+                headers = {"User-Agent": "comfyui-modal-bridge/0.8"}
+            current = nxt
+        else:
+            raise RuntimeError("Too many provider redirects.")
+        if response.status_code == 401 and provider == "Civitai":
+            raise RuntimeError("Civitai returned 401. Check the Civitai API token in Modal Setup, "
+                               "then push the updated Secret and retry.")
+        response.raise_for_status()
+        if "text/html" in response.headers.get("Content-Type", "").lower():
+            raise RuntimeError("Provider returned a web page instead of a model file; check the URL and access permissions.")
+
+        final_name = filename
+        if not final_name:
+            cd = response.headers.get("Content-Disposition", "")
+            match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"?([^\";]+)", cd, re.I)
+            final_name = unquote(next((g for g in match.groups() if g), "")) if match else ""
+            if not final_name:
+                final_name = unquote(Path(urlsplit(url).path).name)
+            if not final_name or "." not in final_name:
+                raise RuntimeError("Could not determine model filename. Enter it in the Filename field.")
+        if (len(final_name) > 240 or final_name in (".", "..") or ".." in final_name
+                or any(ch in final_name for ch in ("/", "\\", "\0", ":"))):
+            raise RuntimeError("Provider supplied an invalid filename; enter a safe filename manually.")
+        if not re.search(r"\.(safetensors|ckpt|pt|pth|bin|gguf|onnx|model|sft|vae)$", final_name, re.I):
+            raise RuntimeError("Unsupported model file extension.")
+        target = (dest_dir / final_name).resolve()
+        if not target.is_relative_to(dest_dir):
+            raise RuntimeError("Invalid model destination.")
+        if target.exists() and not overwrite:
+            raise RuntimeError(f"/models/{model_type}/{final_name} already exists. Enable overwrite to replace it.")
+        part = target.with_name(target.name + ".download-part")
+        total = int(response.headers.get("Content-Length") or 0)
+        if total > 200 * 1024**3:
+            raise RuntimeError("Model exceeds the 200 GiB download limit.")
+        _download_state_update(download_id, message=f"Downloading to /models/{model_type}/{final_name}",
+                               filename=final_name, target=f"/models/{model_type}/{final_name}", total_bytes=total)
+        written = 0
+        last_report = 0
+        with open(part, "wb") as out:
+            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > 200 * 1024**3:
+                    raise RuntimeError("Model exceeds the 200 GiB download limit.")
+                out.write(chunk)
+                if written - last_report >= 16 * 1024**2:
+                    last_report = written
+                    _download_state_update(download_id, downloaded_bytes=written,
+                                           message=f"Downloaded {written / (1024**3):.2f} GiB"
+                                           + (f" / {total / (1024**3):.2f} GiB" if total else ""))
+        if written <= 0 or (total and written != total):
+            raise RuntimeError(f"Incomplete download ({written} bytes; expected {total or 'unknown'}). Try again.")
+        os.replace(part, target)
+        part = None
+        models_vol.commit()
+        _download_state_update(download_id, status="completed", downloaded_bytes=written, total_bytes=total or written,
+                               filename=final_name, target=f"/models/{model_type}/{final_name}",
+                               message=f"Download complete ({written / (1024**3):.2f} GiB). Saved to Modal Volume.")
+        return {"ok": True, "filename": final_name}
+    except Exception as e:
+        if part:
+            try:
+                part.unlink(missing_ok=True)
+            except Exception:
+                pass
+        reason = re.sub(r"https?://\S+", "<provider URL>", str(e))[:300]
+        _download_state_update(download_id, status="failed", error=reason, message=reason)
+        print(f"[bridge] model download {download_id} failed: {reason}")
+        raise
+    finally:
+        if response is not None:
+            response.close()
+
+
+@app.function(image=cuda_image, secrets=[bridge_secret], timeout=15, scaledown_window=SCALEDOWN)
+@modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-download-model")
+def download_model_endpoint(payload: dict):
+    """Start a background download and return immediately (Modal HTTP requests are time-limited)."""
+    deny = _check(payload.get("auth_key", ""))
+    if deny:
+        return deny
+    from fastapi.responses import JSONResponse
+    from urllib.parse import urlsplit
+    url = payload.get("url")
+    model_type = payload.get("model_type")
+    filename = payload.get("filename")
+    overwrite = payload.get("overwrite") is True
+    if not isinstance(url, str) or len(url) > 4096:
+        return JSONResponse({"error": "A model download URL is required (max 4096 characters)."}, status_code=400)
+    if not isinstance(model_type, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", model_type):
+        return JSONResponse({"error": "Invalid model folder."}, status_code=400)
+    if filename is not None and not isinstance(filename, str):
+        return JSONResponse({"error": "filename must be a plain file name."}, status_code=400)
+    filename = filename.strip() if isinstance(filename, str) else ""
+    if filename and (len(filename) > 240 or filename in (".", "..") or ".." in filename
+                     or any(ch in filename for ch in ("/", "\\", "\0", ":"))):
+        return JSONResponse({"error": "filename must be a plain file name without folders or '..'."}, status_code=400)
+    if filename and not re.search(r"\.(safetensors|ckpt|pt|pth|bin|gguf|onnx|model|sft|vae)$", filename, re.I):
+        return JSONResponse({"error": "Unsupported model file extension."}, status_code=400)
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443):
+            raise ValueError
+        if host == "huggingface.co" and "/resolve/" in parsed.path:
+            provider = "Hugging Face"
+        elif host in ("civitai.com", "civitai.red") and re.fullmatch(r"/api/download/models/[0-9]+", parsed.path):
+            provider = "Civitai"
+        else:
+            return JSONResponse({"error": "Use an HTTPS Hugging Face /resolve/ URL or Civitai /api/download/models/<version-id> URL."}, status_code=400)
+    except (ValueError, UnicodeError):
+        return JSONResponse({"error": "Invalid secure model URL."}, status_code=400)
+
+    # Discard completed records after a day to keep the status Dict bounded.
+    try:
+        cutoff = time.time() - 86400
+        for old_id, old in list(model_download_state.items()):
+            if isinstance(old, dict) and (old.get("updated_at") or old.get("created_at") or 0) < cutoff:
+                del model_download_state[old_id]
+    except Exception as e:
+        print(f"[bridge] model download status cleanup skipped: {e}")
+    download_id = uuid.uuid4().hex
+    model_download_state[download_id] = {"status": "queued", "message": "Waiting for the cloud downloader…",
+                                        "created_at": time.time(), "updated_at": time.time(),
+                                        "downloaded_bytes": 0, "total_bytes": 0}
+    try:
+        model_download_job.spawn(url, provider, model_type, filename, overwrite, download_id)
+    except Exception:
+        _download_state_update(download_id, status="failed", error="Cloud function invocation failed.",
+                               message="Could not start the cloud download.")
+        return JSONResponse({"error": "Could not start the cloud download; see Modal logs for details."}, status_code=503)
+    return {"download_id": download_id, "status": "queued"}
+
+
+@app.function(image=cuda_image, secrets=[bridge_secret], timeout=15, scaledown_window=SCALEDOWN)
+@modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-download-model-status")
+def download_model_status_endpoint(download_id: str, x_bridge_key: str = _Header("")):
+    deny = _check(x_bridge_key)
+    if deny:
+        return deny
+    if not re.fullmatch(r"[0-9a-f]{32}", download_id or ""):
+        return {"error": "Invalid download id."}
+    state = model_download_state.get(download_id)
+    if not isinstance(state, dict):
+        return {"error": "Download not found.", "status": "not_found"}
+    return {"download_id": download_id, **state}
+
+
 def _cancel_noop_view(job_id: str, rec: dict, was_running: bool) -> dict:
     """cancel_noop(任务已先一步结束)的响应:只回字段子集。
 
@@ -1468,7 +1696,7 @@ def _cancel_noop_view(job_id: str, rec: dict, was_running: bool) -> dict:
     return out
 
 
-@app.function(image=cuda_image, secrets=[bridge_secret], timeout=15)
+@app.function(image=cuda_image, secrets=[bridge_secret], timeout=15, scaledown_window=SCALEDOWN)
 @modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-cancel")
 def cancel_endpoint(payload: dict):
     deny = _check(payload.get("auth_key", ""))
@@ -1564,7 +1792,7 @@ def cancel_endpoint(payload: dict):
     return {"id": job_id, "status": "cancelled", "was_running": was_running}
 
 
-@app.function(image=cuda_image, secrets=[bridge_secret], timeout=10)
+@app.function(image=cuda_image, secrets=[bridge_secret], timeout=10, scaledown_window=SCALEDOWN)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-health")
 def health_endpoint(key: str = "", x_bridge_key: str = _Header("")):
     """健康 + 已装 custom_nodes(权威源:反映真实部署的镜像,供本地双向同步对比)。"""

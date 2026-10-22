@@ -40,6 +40,14 @@ LOCAL_REQS_FILE = MODAL_APP_DIR / "_local_nodes_data.py"
 PYPROJECT = _HERE / "pyproject.toml"
 
 
+def utf8_subprocess_env(env: dict | None = None) -> dict:
+    """Give Python subprocesses stable UTF-8 console streams on Windows."""
+    child_env = dict(os.environ if env is None else env)
+    child_env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+    child_env["PYTHONUTF8"] = "1"
+    return child_env
+
+
 def plugin_version() -> str:
     """读 pyproject.toml 的 version(版本契约的真源)。读不到返回 '0.0.0'。"""
     try:
@@ -78,7 +86,8 @@ def list_comfyui_tags(repo: str = COMFYUI_REPO, timeout: int = 20) -> list[str]:
     """git ls-remote 拿 ComfyUI 仓库的 vX.Y.Z tag 列表(去掉 ^{} 解引用行)。失败返回 []。"""
     try:
         out = subprocess.run(["git", "ls-remote", "--tags", repo],
-                             capture_output=True, text=True, timeout=timeout)
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=timeout)
         if out.returncode != 0:
             return []
         tags = []
@@ -1026,7 +1035,8 @@ def _comfyui_root() -> Path:
 def _git(args: list[str], cwd: Path) -> str | None:
     try:
         r = subprocess.run(["git", *args], cwd=str(cwd),
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=10)
         if r.returncode == 0:
             return r.stdout.strip()
     except Exception:
@@ -1486,7 +1496,7 @@ def modal_available() -> bool:
     try:
         r = subprocess.run(
             [sys.executable, "-c", "import modal; print(modal.__version__)"],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
         )
         return r.returncode == 0
     except Exception:
@@ -1667,6 +1677,12 @@ _SECRET_UPSERT_BOOT = ("import sys;sys.path.insert(0,sys.argv[1]);import node_sy
 
 def _secret_upsert_main(argv: list[str], modal_mod=None) -> int:
     """secret_upsert_cmd 的执行体:argv = [<secret 名>, KEY=VALUE…, --clear=KEY…]。"""
+    # The embedded Windows interpreter may inherit cp1252 when stdout is piped.
+    # Keep status output from turning a successful Secret update into failure.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
     if not argv:
         print("用法: python node_sync.py secret-upsert <secret 名> KEY=VALUE... [--clear=KEY ...]")
         return 2
@@ -1710,7 +1726,7 @@ def _secret_upsert_main(argv: list[str], modal_mod=None) -> int:
 def deploy_env(cfg: dict) -> dict:
     """从 config 拼出 modal deploy / secret 需要的环境变量(MODAL_BRIDGE_* + 鉴权)。"""
     app_name = cfg.get("modal_app_name", "comfyui-bridge")
-    env = os.environ.copy()
+    env = utf8_subprocess_env()
     env["MODAL_BRIDGE_APP_NAME"] = app_name
     env["MODAL_BRIDGE_VOLUME"] = cfg.get("modal_volume_name", "comfyui-bridge-models")
     env["MODAL_BRIDGE_SECRET"] = f"{app_name}-secrets"
@@ -1718,7 +1734,7 @@ def deploy_env(cfg: dict) -> dict:
     env["MODAL_BRIDGE_DEFAULT_GPU"] = cfg.get("default_gpu", "H100")
     env["MODAL_BRIDGE_CHEAP_GPU"] = cfg.get("cheap_gpu", "L40S")  # 省钱档 GPU(自动降档目标)
     env["MODAL_BRIDGE_TOP_GPU"] = cfg.get("top_gpu", "B200")      # 顶配档 GPU(>主卡显存时自动升档,防 OOM)
-    env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 12))
+    env["MODAL_BRIDGE_SCALEDOWN"] = str(cfg.get("scaledown_window", 2))
     env["MODAL_BRIDGE_TIMEOUT"] = str(cfg.get("worker_timeout_sec", 1200))  # worker 超时上限(覆盖最慢类别)
     env["MODAL_BRIDGE_SNAPSHOT"] = "1" if cfg.get("enable_snapshot") else "0"  # 内存快照开关(实验)
     # 关掉云端 ComfyUI 的动态 VRAM(改用估算式加载)。开着时权重只常驻极少一部分、其余按需

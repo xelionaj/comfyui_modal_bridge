@@ -5,8 +5,8 @@ modal_volume.py — 本地直接用 Modal SDK 操作 Volume(查 + 上传),不经
 里有 modal token。于是本地就能 `modal.Volume.from_name(...)` 列目录 / batch_upload,
 通用大模型靠 Modal Volume 的 CAS 块级去重秒过(相同内容不重复上传)。
 
-模型策略(新):模型都在本地 ComfyUI Desktop 下好 → 提交前查 Volume 缺哪些 → 本地有的直接
-上传上去。不再从 HF/civitai 下载。
+此模块负责本机上传路径:提交前查 Volume 缺哪些 → 本地有的直接上传。Modal Setup 的云端
+Hugging Face / Civitai 下载由 modal_app.py 的独立 Function 写入同一个 Volume。
 
 被 routes.py(GUI 提交链路)和 sync_models.py(命令行)共用。
 """

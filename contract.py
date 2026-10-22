@@ -21,7 +21,7 @@ _SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # aigc_studio_base_url 是站点地址、不是凭据,可以进;它的旁路密钥走部署面板的
 # 专用输入框 → /deploy,只写 0600 的 config.json,不经这里、也不进 comfy.settings.json。
 PUBLIC_CONFIG_WRITE_FIELDS = frozenset({
-    "gpu_tier", "enable_snapshot", "use_sage_attention", "cpu_tier_when_no_model",
+    "gpu_tier", "default_gpu", "enable_snapshot", "use_sage_attention", "cpu_tier_when_no_model",
     "aigc_studio_base_url",
 })
 
@@ -83,7 +83,7 @@ def merge_after_deploy(base: dict, ours: dict, theirs: dict) -> dict:
 #   出去的东西」,必须用部署的值;留在这里的话,两次排队的部署会让 config 记着前一次的值、Secret
 #   里却是后一次的(深度 review)。
 _PREFER_LATEST_ON_DEPLOY = frozenset({
-    "gpu_tier", "auto_downgrade", "aigc_studio_base_url",
+    "gpu_tier", "default_gpu", "auto_downgrade", "aigc_studio_base_url",
 })
 
 
@@ -191,6 +191,10 @@ def merge_public_config(current: dict, body: dict) -> dict:
         raise ValueError(f"这些字段不能经通用 config API 修改: {unknown}")
     if "gpu_tier" in body and body["gpu_tier"] not in ("auto", "cheap", "primary", "top"):
         raise ValueError("gpu_tier 非法")
+    if "default_gpu" in body and body["default_gpu"] not in (
+            "B300", "B200", "H200", "H100!", "H100", "RTX-PRO-6000", "A100-80GB",
+            "A100-40GB", "L40S", "A10", "L4", "T4"):
+        raise ValueError("default_gpu 非法")
     for key in ("enable_snapshot", "use_sage_attention", "cpu_tier_when_no_model"):
         if key in body and not isinstance(body[key], bool):
             raise ValueError(f"{key} 必须是 boolean")

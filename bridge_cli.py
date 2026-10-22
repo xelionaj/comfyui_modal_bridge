@@ -435,14 +435,16 @@ def cmd_deploy(args):
                            cfg, cfg.get("hf_token", ""), cfg.get("civitai_token", ""), bridge_key,
                            cfg.get("comfy_api_key", ""), cfg.get("aigc_studio_base_url", ""),
                            cfg.get("aigc_bypass_secret", "")),
-                       env=env, capture_output=True, text=True)
+                       env=env, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         sys.exit(f"secret 写入失败:{((r.stdout or '') + (r.stderr or ''))[-500:]}\n"
                  f"(先 `pip install modal && modal token new`)")
 
     print(f"[3/3] modal deploy(ComfyUI tag {cfg['comfyui_tag']},首次要构建镜像,10 分钟级)…")
     proc = subprocess.Popen(node_sync.deploy_command(), cwd=str(_HERE / "modal_app"), env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace")
     tail_lines: list[str] = []
     for line in proc.stdout:
         print("  " + line.rstrip(), flush=True)
@@ -481,11 +483,17 @@ def cmd_upload_model(args):
         sys.exit(f"文件不存在: {src}")
     remote = f"/models/{args.type}/{src.name}"
     print(f"{src.name} → {volume}:{remote}(modal volume put,大文件走上行带宽)")
-    r = subprocess.run(_modal_cmd("volume", "put", volume, str(src), remote))
+    r = subprocess.run(_modal_cmd("volume", "put", volume, str(src), remote),
+                       env=node_sync.utf8_subprocess_env())
     sys.exit(r.returncode)
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError):
+            pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 

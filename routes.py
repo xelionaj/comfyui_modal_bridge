@@ -12,6 +12,7 @@ import mimetypes
 import re
 import secrets
 import subprocess
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -47,6 +48,50 @@ _TYPE_ALIASES = {
     "text_encoders": ["clip"],
     "clip": ["text_encoders"],
 }
+
+# Cloud models live only in the Modal Volume, while ComfyUI builds loader dropdowns
+# from the local folder_paths API. Merge a cached Volume inventory into those lists
+# so a cloud-only model can be selected in the local workflow editor.
+_CLOUD_MODEL_LIST_LOCK = threading.RLock()
+_CLOUD_MODEL_LISTS: dict[str, set[str]] = {}
+_ORIGINAL_GET_FILENAME_LIST = getattr(folder_paths, "get_filename_list", None) if folder_paths else None
+
+
+def _cloud_aware_filename_list(type_: str) -> list[str]:
+    names = _ORIGINAL_GET_FILENAME_LIST(type_)
+    with _CLOUD_MODEL_LIST_LOCK:
+        cloud_names = _CLOUD_MODEL_LISTS.get(type_, ())
+        if not cloud_names:
+            return names
+        return sorted(set(names).union(cloud_names), key=str.casefold)
+
+
+if _ORIGINAL_GET_FILENAME_LIST:
+    folder_paths.get_filename_list = _cloud_aware_filename_list
+
+
+def _refresh_cloud_model_lists(cfg: dict, types=None) -> dict[str, int]:
+    """Refresh cloud-only model names from Modal Volume into local loader choices."""
+    if folder_paths is None:
+        raise RuntimeError("ComfyUI folder_paths is unavailable")
+    if not modal_volume.modal_importable():
+        raise RuntimeError("Modal SDK is unavailable in this ComfyUI environment")
+    wanted = set(types or folder_paths.folder_names_and_paths.keys())
+    volume_files = modal_volume.volume_files_by_type(cfg, wanted)
+    result: dict[str, int] = {}
+    with _CLOUD_MODEL_LIST_LOCK:
+        for type_ in wanted:
+            files = volume_files.get(type_, {})
+            names = {name for name in files
+                     if Path(name).suffix.lower() in modal_volume.MODEL_EXTS}
+            _CLOUD_MODEL_LISTS[type_] = names
+            result[type_] = len(names)
+        # Keep ComfyUI's legacy and current model names in sync (UNET / CLIP).
+        for current, aliases in _TYPE_ALIASES.items():
+            if current in wanted:
+                for alias in aliases:
+                    _CLOUD_MODEL_LISTS[alias] = set(_CLOUD_MODEL_LISTS.get(current, ()))
+    return result
 
 
 def _local_model_resolver():
@@ -130,7 +175,9 @@ def extract_required_models(prompt: dict) -> list[dict]:
 
 
 # 各 GPU 显存(GB)。用于"按工作流估算显存自动选便宜档"。与前端 GPU_VRAM 保持一致。
-_GPU_VRAM_GB = {"L40S": 48, "A100-80GB": 80, "H100": 80, "H200": 141, "B200": 180, "A10G": 24, "L4": 24}
+_GPU_VRAM_GB = {"B300": 288, "B200": 180, "H200": 141, "H100!": 80, "H100": 80,
+                "RTX-PRO-6000": 96, "A100-80GB": 80, "A100-40GB": 40,
+                "L40S": 48, "A10": 24, "L4": 24, "T4": 16}
 _CHEAP_MARGIN_GB = 6  # 余量:估算 + 激活波动,est_vram 要比便宜卡显存低这么多才敢降档(防 OOM)
 
 # 云端各档排不到卡时的 fallback 链。**这是 modal_app/modal_app.py 里 _GPU_CHAIN 的副本**(云端不能
@@ -138,11 +185,11 @@ _CHEAP_MARGIN_GB = 6  # 余量:估算 + 激活波动,est_vram 要比便宜卡显
 # 为什么要它(契约 C11,2026-10-05 深度 review):主档选 H200 时,云端排不到 H200 会落到 H100。
 # 以前按 H200 的 141G 判「放得下」,估算 110G 的工作流不升档 → 落到 H100 就 OOM。
 _GPU_FALLBACK_CHAIN = {
-    "B200":      ["B200", "H200", "H100"],
-    "H100":      ["H100", "A100-80GB"],
-    "H200":      ["H200", "H100"],
-    "A100-80GB": ["A100-80GB"],
-    "L40S":      ["L40S"],
+    "B300": ["B300"], "B200": ["B200", "H200", "H100!"],
+    "H200": ["H200", "H100!"], "H100!": ["H100!", "A100-80GB"], "H100": ["H100", "A100-80GB"],
+    "RTX-PRO-6000": ["RTX-PRO-6000"], "A100-80GB": ["A100-80GB"],
+    "A100-40GB": ["A100-40GB"], "L40S": ["L40S"], "A10": ["A10"],
+    "L4": ["L4"], "T4": ["T4"],
 }
 
 
@@ -246,7 +293,8 @@ def _pick_gpu_class(prompt: dict, cfg: dict, required: list | None = None) -> tu
     #    est 已含系数余量(图像×1.15 / 视频×1.3+8),再减 margin 会双重保守:
     #    例 FLUX.2-dev est≈76G,实际在 H100/A100 80G 上跑得动,不该误升 H200。
     #    需有可信估算(unknown==0)。
-    if (top_gpu and top_gpu != primary_gpu and unknown == 0
+    if (top_gpu and top_gpu != primary_gpu
+            and _tier_capacity_gb(top_gpu, 80) > primary_vram and unknown == 0
             and est > primary_vram):
         return "top", f"估算 {est:.1f}G > 主卡 {primary_label}({primary_vram}G) → 升档 {top_gpu}"
 
@@ -647,8 +695,9 @@ async def _run_streamed(resp: web.StreamResponse, cmd: list[str], cwd: str, env:
 
     def work(emit):
         try:
+            child_env = node_sync.utf8_subprocess_env(env)
             proc = subprocess.Popen(
-                cmd, cwd=cwd, env=env,
+                cmd, cwd=cwd, env=child_env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, encoding="utf-8", errors="replace",
             )
@@ -1043,7 +1092,8 @@ _HEALTH_404_RETRY_S = 3.0
 # ⚠ 以前不校验:把 https://modal.com/... 整个粘进 workspace,会拼出 https://https://... 并落盘,
 #   之后每个请求都失败,还看不出原因(深度 review)。
 _MODAL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-_LONGEST_LABEL_SUFFIX = max(len("-" + x) for x in ("run", "status", "fetch", "cancel", "health"))
+_LONGEST_LABEL_SUFFIX = max(len("-" + x) for x in (
+    "run", "status", "fetch", "cancel", "health", "download-model", "download-model-status"))
 
 
 def _deploy_name_errors(workspace: str, app_name: str) -> list[str]:
@@ -1092,7 +1142,7 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
         return 2, ()
     volume_name = (body.get("volume_name") or cfg.get("modal_volume_name") or "comfyui-bridge-models").strip()
     default_gpu = (body.get("default_gpu") or cfg.get("default_gpu") or "H100").strip()
-    scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 12)
+    scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 2)
     # ⚠ 下面 secret create 用的是 --force,会**整份替换** Modal Secret。HF / Civitai token
     #   以前只从请求体取、从不持久化,而面板根本不发这两个字段 —— 于是用 deploy.py
     #   --hf-token 配过的 token,点一次「推送到云端」就被抹掉,节点下 gated 权重静默失败。
@@ -1883,6 +1933,137 @@ def _setup_routes():
 
         return await _stream_run(request, "模型同步", run)
 
+    @routes.post("/modal_bridge/download_model")
+    @_admin_only
+    async def _download_model(request: web.Request):
+        """Ask the cloud downloader to fetch from Hugging Face/Civitai straight into Modal Volume.
+        Browser/PC only sends URL + destination metadata; no model bytes pass through the PC.
+        body: {url, model_type, filename?, overwrite?}
+        """
+        body = await _json_object(request)
+        url = body.get("url")
+        model_type = body.get("model_type")
+        filename = body.get("filename", "")
+        overwrite = body.get("overwrite", False)
+        if not isinstance(url, str) or len(url) > 4096:
+            raise _BadRequest("Paste a Hugging Face or Civitai model download URL.")
+        if not isinstance(model_type, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", model_type):
+            raise _BadRequest("Choose a valid ComfyUI model folder.")
+        if not isinstance(filename, str) or len(filename) > 240:
+            raise _BadRequest("Filename must be a plain file name (max 240 characters).")
+        if not isinstance(overwrite, bool):
+            raise _BadRequest("overwrite must be a boolean.")
+        cfg = cfg_mod.load_config()
+        endpoint_base = (cfg.get("modal_endpoint_base") or "").strip()
+        if not endpoint_base or not cfg.get("bridge_api_key"):
+            raise _BadRequest("Deploy the Modal app first so the cloud downloader endpoint is available.")
+
+        async def run(resp: web.StreamResponse) -> int:
+            if _UPLOAD_LOCK.locked():
+                await _emit(resp, "== Another model transfer is running; waiting for it to finish… ==\n")
+            async with _UPLOAD_LOCK:
+                cloud_url = modal_client._endpoint(endpoint_base, "download-model")
+                status_url = modal_client._endpoint(endpoint_base, "download-model-status")
+                timeout = aiohttp.ClientTimeout(total=120, connect=60, sock_connect=60)
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(
+                                cloud_url,
+                                json={"auth_key": cfg["bridge_api_key"], "url": url,
+                                      "model_type": model_type, "filename": filename,
+                                      "overwrite": overwrite},
+                                allow_redirects=False) as cloud:
+                            if cloud.status != 200:
+                                detail = await _cloud_error_text(cloud)
+                                await _emit(resp, f"== ✗ Cloud downloader returned HTTP {cloud.status}: {detail} ==\n")
+                                return 1
+                            try:
+                                started = await cloud.json(content_type=None)
+                            except Exception:
+                                started = {}
+                        if not started.get("download_id"):
+                            await _emit(resp, f"== ✗ Cloud downloader could not start: {started.get('error', 'invalid response')} ==\n")
+                            return 1
+                        download_id = started["download_id"]
+                        await _emit(resp, f"== Cloud download started (id {download_id[:8]}) ==\n")
+                        deadline = time.monotonic() + 6 * 3600
+                        last_message = None
+                        headers = {"X-Bridge-Key": cfg["bridge_api_key"]}
+                        while time.monotonic() < deadline:
+                            async with session.get(status_url, params={"download_id": download_id},
+                                                   headers=headers, allow_redirects=False) as cloud:
+                                if cloud.status != 200:
+                                    detail = await _cloud_error_text(cloud)
+                                    await _emit(resp, f"== ✗ Could not read cloud download status: HTTP {cloud.status}: {detail} ==\n")
+                                    return 1
+                                state = await cloud.json(content_type=None)
+                            status = state.get("status")
+                            message = state.get("message") or status or "Downloading…"
+                            if message != last_message:
+                                total = int(state.get("total_bytes") or 0)
+                                done = int(state.get("downloaded_bytes") or 0)
+                                progress = f" ({done / (1024**3):.2f}/{total / (1024**3):.2f} GiB)" if total else ""
+                                await _emit(resp, f"{message}{progress}\n")
+                                last_message = message
+                            if status == "completed":
+                                try:
+                                    counts = await asyncio.to_thread(
+                                        _refresh_cloud_model_lists, cfg, {model_type})
+                                    await _emit(resp,
+                                                "Cloud model names added to local ComfyUI loader choices. "
+                                                "Refresh the browser page to update existing dropdowns.\n")
+                                except Exception as e:
+                                    await _emit(resp,
+                                                f"Download succeeded, but refreshing local model choices failed: "
+                                                f"{_one_line(e)}. Use Refresh cloud model list.\n")
+                                return 0
+                            if status == "failed":
+                                await _emit(resp, f"== ✗ Download failed: {_one_line(state.get('error') or message)} ==\n")
+                                return 1
+                            if status == "not_found":
+                                await _emit(resp, "== ✗ Cloud download status expired or not found. ==\n")
+                                return 1
+                            await asyncio.sleep(2)
+                        await _emit(resp, "== ✗ Timed out waiting for download status. Check Modal logs; the cloud job may still be running. ==\n")
+                        return 1
+                except Exception as e:
+                    await _emit(resp, f"== ✗ Could not reach the cloud downloader: {_one_line(e)} ==\n")
+                    return 1
+                return 1
+
+        return await _stream_run(request, "云端模型下载", run)
+
+    @routes.post("/modal_bridge/refresh_cloud_models")
+    @_admin_only
+    async def _refresh_cloud_models(request: web.Request):
+        """Refresh local ComfyUI loader dropdown choices from the Modal Volume."""
+        body = await _json_object(request)
+        requested = body.get("types")
+        if requested is not None and (not isinstance(requested, list)
+                                      or any(not isinstance(x, str) for x in requested)):
+            raise _BadRequest("types must be a list of model folder names")
+        if requested:
+            known_types = set(folder_paths.folder_names_and_paths) if folder_paths else set()
+            unknown = sorted(set(requested) - known_types)
+            if unknown:
+                raise _BadRequest(f"Unknown model folders: {unknown[:5]}")
+        cfg = cfg_mod.load_config()
+
+        async def run(resp: web.StreamResponse) -> int:
+            try:
+                types = set(requested) if requested else None
+                counts = await asyncio.to_thread(_refresh_cloud_model_lists, cfg, types)
+                total = sum(counts.values())
+                await _emit(resp, f"== Cloud model list refreshed: {total} files across "
+                                  f"{len(counts)} model folders. Reload the browser page to update "
+                                  f"existing node dropdowns. ==\n")
+                return 0
+            except Exception as e:
+                await _emit(resp, f"== ✗ Could not refresh cloud model list: {_one_line(e)} ==\n")
+                return 1
+
+        return await _stream_run(request, "云端模型列表刷新", run)
+
     @routes.post("/modal_bridge/sync_local_nodes")
     @_admin_only
     async def _sync_local_nodes(request: web.Request):
@@ -2310,6 +2491,8 @@ def _setup_routes():
             raise _BadRequest("auto_downgrade 必须是 boolean")
         if (body.get("gpu_tier") or "").strip().lower() not in ("", "auto", "cheap", "primary", "top"):
             raise _BadRequest("gpu_tier 非法")
+        if body.get("default_gpu") and body["default_gpu"] not in _GPU_VRAM_GB:
+            raise _BadRequest("default_gpu 非法")
         # token_secret 现在不回显到前端(/config 已抹掉),留空 = 沿用已存的;token_id 同理
         _stored = cfg_mod.load_config()
         token_id = (body.get("token_id") or "").strip() or (_stored.get("modal_token_id") or "")

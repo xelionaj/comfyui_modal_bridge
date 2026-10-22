@@ -62,7 +62,7 @@ Simplified CLI path: `python deploy.py --workspace <ws> --token-id ak-xxx --toke
 
 ## 3. Usage
 
-1. Open/build a workflow (download models locally first)
+1. Open/build a workflow (download models in Modal Setup, or download locally for automatic upload)
 2. Click **[☁️ Modal]**
 3. Auto: node sync → model sync (local→Volume) → submit Modal (H100) → result back to canvas
 

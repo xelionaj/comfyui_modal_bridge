@@ -3,7 +3,7 @@
 > 中文 | [English](#english)
 
 把当前 ComfyUI 工作流一键推到 Modal Serverless GPU(H100)上跑,出图回流本地。
-**模型在本地 ComfyUI Desktop 下好**,提交时自动把云端缺的同步上去(本地 → Modal Volume,块级去重,通用大模型秒过)。custom_node 自动同步。
+**模型可在 Modal Setup 里直接下载到云端 Volume**,也可在本机下载后自动上传缺少的模型。custom_node 自动同步。
 
 ## TL;DR
 
@@ -52,7 +52,7 @@ python deploy.py --workspace <你的workspace> --token-id ak-xxx --token-secret 
 4. **必填输入预检**:按当前本地节点定义检查各节点是否缺必填输入(常见:必填连线没接;或老工作流里的节点在新版新增了必填 widget,如内置 API 节点的 `generate_type`,老图没带上)→ 弹提示(可仍要提交 / 去修),避免等云端 `execute() missing required argument` 才报错。纯本地检查所以放最前,不用先等节点同步重部署;拿不到定义的节点跳过,不误报
 5. **custom_node 同步**:工作流用到、云端没有的节点 → 自动加 + 重部署(只这一次,之后秒进)
 6. **显存预检**:模型总显存(按类别估,视频含多帧激活开销)超所选卡 → 弹警告(可仍要跑 / 去换卡)
-7. **模型同步**:云端 Volume 缺、本地有 → 上传(CAS 去重);云端和本地都没有 → 提示先在本地下好
+7. **模型同步**:可以在 Modal Setup 里粘贴 Hugging Face / Civitai 下载 URL,直接下载到云端 Volume;也可从本机自动上传缺少的模型(CAS 去重)
 8. **CPU / GPU 路由**:工作流无本地模型(纯 API)→ CPU 容器(账单≈0);要 sample → GPU 容器
 9. 提交 Modal → 轮询 → 小文件 base64 / 大文件走 Volume 直连 → 写 `output/modal_results/<job_id>/` → 按来源节点回填:SaveImage 出图、SaveVideo 出视频、**SaveGLB / Preview3D 出 3D 转盘**
 
@@ -93,12 +93,12 @@ bridge 扫工作流**所有输出节点**取产物并回填画板:
 - ⚠ 账单走**你的 comfy.org 额度**;
 - 前端检测到工作流有 API 节点但没配 key,会在提交前提示。
 
-## 模型策略(本地 → Volume)
+## 模型下载(直达云端或本机上传)
 
-- 模型在本地下好(放 `models/<类型>/`)。`unet/` 与 `diffusion_models/`、`clip/` 与 `text_encoders/` 互为别名,放哪个都认。
-- 提交时本地用 modal SDK 查 Volume、传缺的。不经任何 endpoint、不从 HF 下载、不依赖 registry。
+- Modal Setup 可粘贴 Hugging Face `/resolve/` 或 Civitai `/api/download/models/<version-id>` URL,选择 ComfyUI 模型目录后直接下载到持久化 Modal Volume;模型文件不会经过本机。下载完成后云端文件名会并入本地 loader 下拉选项;刷新浏览器页面后即可选择。已下载的模型可用 **Refresh cloud model list** 同步选项。私有/受限模型可在 Setup 填 Hugging Face 或 Civitai token,部署一次后生效。
+- 也可把模型放到本地 `models/<类型>/`;`unet/`↔`diffusion_models/`、`clip/`↔`text_encoders/` 是别名。提交时本地 SDK 会上传云端缺少的工作流模型。
 - 一次性整体推送:`python sync_models.py [--dry-run] [--type loras]`。
-- 为什么快:Modal Volume 块级去重(CAS),通用大模型很多人传过 → 你这边秒过,只有自训练/私有模型才真占上行带宽。
+- 云端下载使用 Modal 网络;本机上传使用你的上行带宽。Modal Volume 块级去重(CAS)可让常见模型上传秒过。
 
 ## custom_node(多机)
 
@@ -198,7 +198,7 @@ comfyui_modal_bridge/
 > [中文](#部署指南--setup-guide) | English
 
 Push the current ComfyUI workflow to a Modal Serverless GPU (H100) with one click; results flow back locally.
-**Download models locally in ComfyUI Desktop**; on submit, anything missing in the cloud is auto-synced (local → Modal Volume, block dedup, common big models are instant). Custom nodes auto-sync too.
+**Download models directly to the Modal Volume from Setup**, or download locally and let submit upload anything missing. Custom nodes auto-sync too.
 
 ## TL;DR
 
@@ -289,12 +289,12 @@ Workflows with API nodes need a comfy.org API key (generated at platform.comfy.o
 - ⚠ Billed to **your comfy.org credits**;
 - the frontend warns before submit if the workflow has API nodes but no key is configured.
 
-## Model strategy (local → Volume)
+## Model downloads (direct to cloud or local upload)
 
-- Download models locally (`models/<type>/`). `unet/`↔`diffusion_models/` and `clip/`↔`text_encoders/` are aliases — either works.
-- On submit, the local modal SDK lists the Volume and uploads what's missing. No endpoint, no HF download, no registry.
+- In Modal Setup, paste a Hugging Face `/resolve/` or Civitai `/api/download/models/<version-id>` URL, choose the ComfyUI model folder, and download directly into the persistent Modal Volume. Model bytes do not pass through your PC. After download, cloud filenames are added to local loader dropdown choices; reload the browser page to update existing dropdowns. Use **Refresh cloud model list** for models downloaded earlier. Private/gated downloads can use the Hugging Face or Civitai token fields in Setup; deploy once after adding/changing a token.
+- Or download models locally under `models/<type>/`. `unet/`↔`diffusion_models/` and `clip/`↔`text_encoders/` are aliases — either works. On submit, the local Modal SDK uploads any workflow models missing from the Volume.
 - Bulk push: `python sync_models.py [--dry-run] [--type loras]`.
-- Why fast: Modal Volume block-level dedup (CAS) — common big models others have uploaded are instant for you; only custom/private models actually use your upstream bandwidth.
+- Direct cloud downloads use the cloud worker's network; local uploads use your upstream bandwidth. Modal Volume block-level dedup (CAS) can make common model uploads instant.
 
 ## Custom nodes (multi-machine)
 

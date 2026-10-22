@@ -20,9 +20,8 @@ DEFAULT_CONFIG = {
     "modal_app_name": "comfyui-bridge",
     "modal_workspace": "",                       # 用于拼 endpoint
     "modal_volume_name": "comfyui-bridge-models",  # 重部署(加 custom_node)时要
-    "scaledown_window": 12,                      # 空闲多久回收容器(s);重部署时要。
-    # 12s:典型用法是「跑一次、看结果、再调参」,间隔远大于窗口,留久了纯空转计费。
-    # 留 12s 是为了「失败立刻重试」还能复用容器(冷启约 20+s,比窗口贵得多)。
+    "scaledown_window": 2,                       # 空闲多久回收容器(s);重部署时要。
+    # Keep the idle window at Modal's 2-second minimum to release GPU workers quickly.
 
     # ── 鉴权(私有 endpoint,deploy.py / GUI 部署自动写)──
     "modal_token_id": "",      # ak-xxx(account token,仅本机 deploy 用)
@@ -89,7 +88,7 @@ DEFAULT_CONFIG = {
 
     # ── 模型自动同步(本地 → Modal Volume,SDK batch_upload,CAS 去重)──
     # 提交前检查 Volume,工作流要、Volume 没、但本地有的模型自动上传上去。
-    # 不再从 HF/civitai 下载——模型都在本地 ComfyUI Desktop 下好。
+    # Modal Setup 也可从 Hugging Face / Civitai 直接下载到 Volume,无需经过本机。
     "auto_sync_models": True,
     "model_sync_timeout_sec": 3600,  # 上传整批模型的超时(大模型走上行带宽)
 
@@ -174,7 +173,12 @@ def load_config() -> dict:
     """读取 config,缺字段用默认值兜底。文件存在但损坏时抛 ConfigCorrupt,**不**退回默认值。"""
     p = ensure_config()
     data = _read_config_file(p)
-    return {**DEFAULT_CONFIG, **(data or {})}
+    cfg = {**DEFAULT_CONFIG, **(data or {})}
+    # 12s was the old built-in default. Migrate that default in memory so an
+    # existing install also gets the faster scale-to-zero setting on redeploy.
+    if cfg.get("scaledown_window") == 12:
+        cfg["scaledown_window"] = 2
+    return cfg
 
 
 def save_config(new_data: dict) -> None:

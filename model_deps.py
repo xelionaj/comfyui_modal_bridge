@@ -12,6 +12,7 @@ model_deps.py — 从工作流 prompt 解析需要的模型文件(纯逻辑,无�
 命中位置反推,涉及文件系统,放在 routes.py(用 folder_paths.get_full_path(t, 相对路径));这里只做纯解析。
 """
 from pathlib import Path
+import json
 
 # 与前端 Export API 的扩展名集合严格对齐(见模块 docstring)。注意:不含图片扩展名,
 # 所以 LoadImage 的 .png/.jpg 天然不会被通用兜底误中。
@@ -40,19 +41,60 @@ LOADER_MAP = {
 
 
 def extract_loader_models(prompt: dict) -> list[dict]:
-    """LOADER_MAP 命中的模型(已知 type)。返回 [{type, filename}, ...] 去重。"""
+    """Known loader models plus LoRA files exposed by custom loader nodes.
+
+    Custom LoRA nodes use many class and input names, so the built-in map alone
+    misses them. A model filename on an input whose name or node class mentions
+    LoRA is unambiguously a lora dependency; recording its type here also lets
+    cloud-only LoRAs be checked against the Modal Volume without a local copy.
+    Returns [{type, filename}, ...] with duplicates removed.
+    """
     deps: list[dict] = []
     seen: set[tuple] = set()
     for node in (prompt or {}).values():
         if not isinstance(node, dict):
             continue
-        spec = LOADER_MAP.get(node.get("class_type", ""))
-        if not spec:
-            continue
-        type_, fields = spec
         ins = node.get("inputs") or {}
-        for f in fields:
-            name = ins.get(f)
+        if not isinstance(ins, dict):
+            continue
+        class_type = str(node.get("class_type", ""))
+        spec = LOADER_MAP.get(class_type)
+        candidates = []
+        if spec:
+            type_, fields = spec
+            candidates.extend((type_, ins.get(field)) for field in fields)
+
+        # Pixaroma's LoRA Loader stores its dynamic rows in a JSON string rather
+        # than separate prompt inputs: {"loras":[{"name": ..., "on": true}]}.
+        # Its node JS injects this into the hidden LoraLoaderState input when
+        # graphToPrompt runs, so extract only the enabled file rows here.
+        state_value = ins.get("LoraLoaderState")
+        if isinstance(state_value, str) and state_value.strip():
+            try:
+                state = json.loads(state_value)
+            except (TypeError, ValueError):
+                state = None
+            rows = state.get("loras", []) if isinstance(state, dict) else []
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict) or not row.get("on"):
+                        continue
+                    name = row.get("name")
+                    if isinstance(name, str) and Path(name).suffix.lower() in MODEL_EXTS:
+                        candidates.append(("loras", name))
+
+        # Custom node packs vary their class/input names (e.g. Power Lora Loader,
+        # multi-LoRA stacks). Recognize model-file inputs from the node class or
+        # input label, while ignoring strength/trigger/text fields.
+        for field, value in ins.items():
+            if not isinstance(value, str) or not value.strip():
+                continue
+            is_lora_loader = "lora" in class_type.casefold()
+            is_lora_input = "lora" in str(field).casefold()
+            if (is_lora_loader or is_lora_input) and Path(value).suffix.lower() in MODEL_EXTS:
+                candidates.append(("loras", value))
+
+        for type_, name in candidates:
             if isinstance(name, str) and name.strip():
                 key = (type_, name)
                 if key in seen:

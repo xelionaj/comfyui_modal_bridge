@@ -2237,7 +2237,18 @@ async function ensureModelsAvailable(prompt, ctx) {
 // 主入口:批量包装
 // =====================================================================
 // GPU 显存表(GB)。键与 Setup 下拉/后端 default_gpu 一致。
-const GPU_VRAM = { "L40S": 48, "A100-80GB": 80, "H100": 80, "H200": 141, "B200": 180 };
+const GPU_VRAM = { "B300": 288, "B200": 180, "H200": 141, "H100!": 80,
+  "H100": 80, "RTX-PRO-6000": 96, "A100-80GB": 80, "A100-40GB": 40,
+  "L40S": 48, "A10": 24, "L4": 24, "T4": 16 };
+
+const MODAL_GPU_CHOICES = [
+  ["B300", "NVIDIA B300", "$7.10 / h"], ["B200", "NVIDIA B200", "$6.25 / h"],
+  ["H200", "NVIDIA H200 SXM", "$4.54 / h"], ["H100!", "NVIDIA H100 SXM5", "$3.95 / h"],
+  ["RTX-PRO-6000", "NVIDIA RTX PRO 6000", "$3.03 / h"],
+  ["A100-80GB", "NVIDIA A100 80 GB", "$2.50 / h"], ["A100-40GB", "NVIDIA A100 40 GB", "$2.10 / h"],
+  ["L40S", "NVIDIA L40S", "$1.95 / h"], ["A10", "NVIDIA A10", "$1.10 / h"],
+  ["L4", "NVIDIA L4", "$0.80 / h"], ["T4", "NVIDIA T4", "$0.59 / h"],
+];
 
 // 显存预警:点 Modal 前用「模型总显存 ×1.15」对比所选显卡。超了弹确认。
 // 返回 true=继续, false=用户中止(去换显卡)。任何异常都放行 —— 预警是辅助,不该挡正常流程。
@@ -2249,7 +2260,9 @@ async function vramPreflightOrConfirm(prompt, cfgNow) {
     // 档位判定须与后端 routes.resolve_gpu_tier 一致(gpu_tier 优先,空则回落 auto_downgrade)。
     const tier = (cfgNow.gpu_tier || "").trim().toLowerCase()
       || (cfgNow.auto_downgrade === false ? "primary" : "auto");
-    const gpu = tier === "auto" ? (cfgNow.top_gpu || "B200")
+    const autoGpu = (GPU_VRAM[cfgNow.top_gpu || "B200"] || 0) > (GPU_VRAM[cfgNow.default_gpu || "H100"] || 0)
+      ? (cfgNow.top_gpu || "B200") : (cfgNow.default_gpu || "H100");
+    const gpu = tier === "auto" ? autoGpu
       : tier === "cheap" ? (cfgNow.cheap_gpu || "L40S")
       : tier === "top" ? (cfgNow.top_gpu || "B200")
       : (cfgNow.default_gpu || "H100");
@@ -3076,6 +3089,11 @@ async function openDeployDialog() {
 
     <div style="${groupCss}">
       <div style="${groupHeadCss}"><span style="${groupBarCss}"></span>${t("dlg.grp.run")}</div>
+      <label style="${labelCss}">Primary GPU model <span style="${hintCss}">(Modal price estimate; applies after deploy)</span></label>
+      <select id="mb-dep-gpumodel" style="${inputCss}">
+        ${MODAL_GPU_CHOICES.map(([value, name, price]) => `<option value="${value}"${((cfg.default_gpu || "H100")===value || (cfg.default_gpu==="H100" && value==="H100!"))?" selected":""}>${name} — ${price}</option>`).join("")}
+      </select>
+      <div id="mb-dep-gpumodelmsg" style="margin:0 0 6px;color:#9aa;font-size:12px;"></div>
       <label style="${labelCss}">GPU <span style="${hintCss}">${t("dlg.gpu.label")}</span></label>
       <select id="mb-dep-gputier" style="${inputCss}">
         <option value="auto"${curTier==="auto"?" selected":""}>${t("dlg.gpu.opt_auto")}</option>
@@ -3088,10 +3106,32 @@ async function openDeployDialog() {
     </div>
 
     <div style="${groupCss}">
+      <div style="${groupHeadCss}"><span style="${groupBarCss}"></span>Download a model directly to Modal</div>
+      <div style="${noteCss}">The model downloads from Hugging Face or Civitai into your persistent Modal Volume. The model file does not pass through your PC. Use a Hugging Face <code>/resolve/</code> URL or Civitai <code>/api/download/models/&lt;version-id&gt;</code> URL.</div>
+      <label style="${labelCss}">Model download URL</label>
+      <input id="mb-dep-model-url" type="url" style="${inputCss}" placeholder="https://huggingface.co/owner/repo/resolve/main/model.safetensors">
+      <label style="${labelCss}">ComfyUI model folder</label>
+      <select id="mb-dep-model-type" style="${inputCss}">
+        ${["checkpoints", "diffusion_models", "unet", "text_encoders", "clip", "vae", "loras", "controlnet", "clip_vision", "upscale_models", "embeddings", "hypernetworks", "style_models", "audio_encoders", "background_removal", "classifiers", "datasets", "detection", "frame_interpolation", "geometry_estimation", "latent_upscale_models", "model_patches", "optical_flow", "photomaker", "gligen", "diffusers", "vae_approx", "pulid", "inpaint", "insightface", "onnx", "sams", "ultralytics"].map((x) => `<option value="${x}">${x}</option>`).join("")}
+      </select>
+      <label style="${labelCss}">Filename <span style="${hintCss}">(optional; inferred from download response)</span></label>
+      <input id="mb-dep-model-filename" type="text" style="${inputCss}" placeholder="model.safetensors">
+      <label style="display:flex;align-items:center;gap:7px;margin:0 0 10px;color:#ddd;"><input id="mb-dep-model-overwrite" type="checkbox"> Replace the file if it already exists</label>
+      <button id="mb-dep-model-download" style="${btnPrimaryCss}">Download to Modal Volume</button>
+      <button id="mb-dep-model-refresh" style="${btnGhostCss}margin-left:6px;">Refresh cloud model list</button>
+      <div id="mb-dep-model-status" style="margin:8px 0;color:#9aa;font-size:12px;"></div>
+      <pre id="mb-dep-model-log" style="display:none;max-height:180px;overflow:auto;white-space:pre-wrap;background:#111;padding:8px;border-radius:6px;color:#ddd;"></pre>
+    </div>
+
+    <div style="${groupCss}">
       <div style="${groupHeadCss}"><span style="${groupBarCss}"></span>${t("dlg.grp.integr")}</div>
       <label style="${labelCss}">comfy.org API Key <span style="${hintCss}">${t("dlg.comfy.hint")}</span></label>
       <input id="mb-dep-comfy" type="password" style="${inputCss}" value="" placeholder="${cfg.has_comfy_api_key ? t("dlg.comfy.ph_saved") : t("dlg.comfy.ph")}">
       <div style="${noteCss}">${t("dlg.comfy.note")}</div>
+      <label style="${labelCss}">Hugging Face token <span style="${hintCss}">(optional; gated/private models)</span></label>
+      <input id="mb-dep-hf-token" type="password" style="${inputCss}" value="" placeholder="${cfg.has_hf_token ? "Saved; leave blank to keep" : "hf_..."}">
+      <label style="${labelCss}">Civitai API token <span style="${hintCss}">(optional; restricted downloads)</span></label>
+      <input id="mb-dep-civitai-token" type="password" style="${inputCss}" value="" placeholder="${cfg.has_civitai_token ? "Saved; leave blank to keep" : "Civitai API token"}">
       <div id="mb-dep-aigc-wrap" style="display:${cfg.aigc_studio_base_url ? "block" : "none"};">
       <label style="${labelCss}">AIGC Bypass Secret <span style="${hintCss}">${t("dlg.aigc.bypass_hint")}</span></label>
       <input id="mb-dep-aigc-bypass" type="password" style="${inputCss}" value="" placeholder="${cfg.has_aigc_bypass_secret ? t("dlg.comfy.ph_saved") : t("dlg.aigc.bypass_ph")}">
@@ -3163,6 +3203,9 @@ async function openDeployDialog() {
     const tierNow = tierOf(cfg);
     const sel = panel.querySelector("#mb-dep-gputier");
     if ([...sel.options].some((o) => o.value === tierNow)) sel.value = tierNow;
+    const modelSel = panel.querySelector("#mb-dep-gpumodel");
+    const currentModel = cfg.default_gpu === "H100" ? "H100!" : cfg.default_gpu;
+    if ([...modelSel.options].some((o) => o.value === currentModel)) modelSel.value = currentModel;
   };
   overlay._applyCfg = applyCfg;
 
@@ -3384,6 +3427,90 @@ async function openDeployDialog() {
     }
   };
 
+  // GPU model is a deploy-time Modal Function setting; save it locally as soon as selected.
+  // Existing deployed workers keep their current GPU until the user pushes a new deploy.
+  const modelSel = panel.querySelector("#mb-dep-gpumodel");
+  const modelMsg = panel.querySelector("#mb-dep-gpumodelmsg");
+  modelSel.onchange = async () => {
+    try {
+      const r = await bridgeFetch("/modal_bridge/config", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ default_gpu: modelSel.value }),
+      });
+      if (!r.ok) throw await httpError(r, "config");
+      const choice = MODAL_GPU_CHOICES.find(([value]) => value === modelSel.value);
+      modelMsg.style.color = "#fbbf24";
+      modelMsg.textContent = `Saved ${choice?.[1] || modelSel.value}. Push to cloud to apply this GPU. Auto routing may send smaller jobs to L40S; choose Primary in GPU routing to use this model for every job.`
+        + (modelSel.value === "B300" ? " B300 requires CUDA 13.1 or newer; this image currently uses CUDA 13.0, so B300 deployment needs a CUDA image update." : "");
+      cfg.default_gpu = modelSel.value;
+    } catch (e) {
+      modelMsg.style.color = "#ef4444";
+      modelMsg.textContent = `Could not save GPU: ${String(e)}`;
+    }
+  };
+  if (modelSel.value === "B300") {
+    modelMsg.style.color = "#fbbf24";
+    modelMsg.textContent = "B300 requires CUDA 13.1 or newer; this image currently uses CUDA 13.0, so B300 deployment needs a CUDA image update.";
+  }
+
+  const downloadModelBtn = panel.querySelector("#mb-dep-model-download");
+  const refreshModelBtn = panel.querySelector("#mb-dep-model-refresh");
+  const downloadModelStatus = panel.querySelector("#mb-dep-model-status");
+  const downloadModelLog = panel.querySelector("#mb-dep-model-log");
+  refreshModelBtn.onclick = async () => {
+    refreshModelBtn.disabled = true;
+    downloadModelLog.style.display = "block";
+    downloadModelLog.textContent = "Refreshing model names from the Modal Volume…\n";
+    downloadModelStatus.style.color = "#9aa";
+    downloadModelStatus.textContent = "Checking cloud model folders…";
+    try {
+      const rc = await streamPost("/modal_bridge/refresh_cloud_models", {}, (line) => {
+        downloadModelLog.textContent += line + "\n";
+        downloadModelLog.scrollTop = downloadModelLog.scrollHeight;
+        downloadModelStatus.textContent = line;
+      });
+      if (rc !== 0) throw new Error("Refresh failed. See the log above.");
+      downloadModelStatus.style.color = "#34d399";
+      downloadModelStatus.textContent = "Cloud model choices refreshed. Reload the browser page to update existing nodes.";
+    } catch (e) {
+      downloadModelStatus.style.color = "#ef4444";
+      downloadModelStatus.textContent = String(e.message || e);
+    } finally {
+      refreshModelBtn.disabled = false;
+    }
+  };
+  downloadModelBtn.onclick = async () => {
+    const url = panel.querySelector("#mb-dep-model-url").value.trim();
+    if (!url) { downloadModelStatus.textContent = "Paste a Hugging Face or Civitai download URL first."; return; }
+    if (panel.querySelector("#mb-dep-model-overwrite").checked
+        && !confirm("Replace this model file in the Modal Volume if it already exists?")) return;
+    downloadModelBtn.disabled = true;
+    downloadModelLog.style.display = "block";
+    downloadModelLog.textContent = "";
+    downloadModelStatus.style.color = "#9aa";
+    downloadModelStatus.textContent = "Connecting to the cloud downloader…";
+    try {
+      const rc = await streamPost("/modal_bridge/download_model", {
+        url,
+        model_type: panel.querySelector("#mb-dep-model-type").value,
+        filename: panel.querySelector("#mb-dep-model-filename").value.trim(),
+        overwrite: panel.querySelector("#mb-dep-model-overwrite").checked,
+      }, (line) => {
+        downloadModelLog.textContent += line + "\n";
+        downloadModelLog.scrollTop = downloadModelLog.scrollHeight;
+        downloadModelStatus.textContent = line;
+      });
+      if (rc !== 0) throw new Error("Download failed. See the log above.");
+      downloadModelStatus.style.color = "#34d399";
+      downloadModelStatus.textContent = "Download complete. The model is in your Modal Volume.";
+    } catch (e) {
+      downloadModelStatus.style.color = "#ef4444";
+      downloadModelStatus.textContent = String(e.message || e);
+    } finally {
+      downloadModelBtn.disabled = false;
+    }
+  };
+
   // SageAttention:和 GPU 档位不同,它不是运行时路由 —— 开关经 deploy_env 烤进镜像 env,
   // 由 worker 启动参数(--use-sage-attention)消费,所以改完必须点「部署」才生效
   // (只重建最后的 .env() 层,秒级)。这里即时存 config,部署时 deploy_env 读走。
@@ -3392,11 +3519,14 @@ async function openDeployDialog() {
       workspace: panel.querySelector("#mb-dep-ws").value.trim(),
       token_id: panel.querySelector("#mb-dep-id").value.trim(),
       token_secret: panel.querySelector("#mb-dep-secret").value.trim(),
+      default_gpu: modelSel.value,
       // ⚠ 这里不再写 default_gpu / auto_downgrade —— 档位改走 gpu_tier(运行时路由,上面
       // 即时保存)。各档具体绑哪张卡由 cheap_gpu / default_gpu / top_gpu 决定,那才是部署期
       // 固定的(@app.cls 的 gpu= 参数),要换卡型得改 config.json 再部署。
       gpu_tier: tierSel.value,
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
+      hf_token: panel.querySelector("#mb-dep-hf-token").value.trim(),
+      civitai_token: panel.querySelector("#mb-dep-civitai-token").value.trim(),
       // AIGC Studio 的 **URL** 在「设置 → Modal Bridge → Advanced」里填,改动即时写回 config,
       // 所以这里不带那个键(后端对「键不存在」保留已存值)。
       // 而**旁路密钥是凭据**,只从下面这个专用密码框走:留空 = 沿用 config 里已存的,
