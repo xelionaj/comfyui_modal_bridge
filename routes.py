@@ -12,6 +12,7 @@ import mimetypes
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -23,6 +24,7 @@ from aiohttp import web
 from . import categories
 from . import config as cfg_mod
 from . import contract
+from . import health_client
 from . import local_nodes
 from . import modal_client
 from . import modal_volume
@@ -1134,6 +1136,14 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
     # 节点同步写回的 key、清单指纹、档位,会被这次部署的收尾当成「部署开始时的值」做三方合并。
     # 缺省值优先沿用已有 config(重新部署时不重置用户之前的选择)
     cfg = cfg_mod.load_config()
+    # Save the validated Modal API token pair before any Modal API / Volume preflight.
+    # A failed preflight must not make the next attempt silently reuse a revoked token.
+    # save_config uses an atomic write and restrictive file permissions.
+    _token_cfg = cfg_mod.load_config()
+    _token_cfg["modal_token_id"] = token_id
+    _token_cfg["modal_token_secret"] = token_secret
+    cfg_mod.save_config(_token_cfg)
+    cfg.update({"modal_token_id": token_id, "modal_token_secret": token_secret})
     app_name = (body.get("app_name") or cfg.get("modal_app_name") or "comfyui-bridge").strip()
     _name_errs = _deploy_name_errors(workspace, app_name)
     if _name_errs:   # 排队期间别处改了 app 名(拿锁前校验过 body / 旧 config)
@@ -1231,6 +1241,63 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
     # ⚠ 本机清单是被 gitignore 的本地状态,却会被当成镜像的全局清单去部署。插件被 Manager
     #   重装、清单丢了 → 上面建出一个空清单 → 这次部署清空云端全部节点;多机时另一台加的
     #   节点也会被删。部署前先把云端有、本机没有的并回来(只加不删)。
+    # If the local baked-node manifest was lost and the existing endpoint rejects its
+    # bridge key, refresh only the Modal Secret and roll over the current App before
+    # reading /health again. Secret updates apply to newly started containers; rollover
+    # replaces them without rebuilding the image, so the cloud node manifest remains
+    # readable and the normal preservation check can still make the deploy decision.
+    if not node_sync.read_baked_nodes() and cfg.get("modal_endpoint_base"):
+        try:
+            await asyncio.to_thread(health_client.fetch, cfg)
+        except health_client.HealthUnavailable as _health_err:
+            if _health_err.kind == "unauthorized":
+                bridge_key = node_sync.gen_bridge_key()
+                _key_cfg = cfg_mod.load_config()
+                _key_cfg["bridge_api_key"] = bridge_key
+                cfg_mod.save_config(_key_cfg)
+                cfg["bridge_api_key"] = bridge_key
+                _deploy_updates["bridge_api_key"] = bridge_key
+                await _emit(resp, "\n== Cloud bridge key rejected; refreshing authentication without rebuilding the image ==\n")
+                _key_rc = await _run_streamed(
+                    resp,
+                    node_sync.secret_upsert_cmd(cfg, bridge_key=bridge_key, require_update=True),
+                    cwd=cwd,
+                    env=env,
+                )
+                if _key_rc != 0:
+                    await _emit_abort(resp, "Could not update the Modal Secret with the refreshed bridge key. "
+                                            "The cloud image was not rebuilt; check the Member API token and retry.")
+                    return _key_rc, ()
+                _roll_rc = await _run_streamed(
+                    resp,
+                    [sys.executable, "-m", "modal", "app", "rollover", app_name],
+                    cwd=cwd,
+                    env=env,
+                )
+                if _roll_rc != 0:
+                    await _emit_abort(resp, "The bridge key was updated in the Modal Secret, but the existing App "
+                                            "could not be rolled over. The image was not rebuilt; retry after checking "
+                                            "the Modal app status.")
+                    return _roll_rc, ()
+                _health_ok = False
+                for _attempt in range(4):
+                    try:
+                        await asyncio.to_thread(health_client.fetch, cfg)
+                        _health_ok = True
+                        break
+                    except health_client.HealthUnavailable as _retry_err:
+                        if _retry_err.kind != "unreachable" and _retry_err.kind != "unauthorized":
+                            break
+                        await asyncio.sleep(2)
+                if not _health_ok:
+                    await _emit_abort(resp, "The Modal Secret was updated, but /health still does not accept the "
+                                            "refreshed bridge key. The cloud image was not rebuilt; check the app "
+                                            "workspace and deployment status before retrying.")
+                    return 1, ()
+            elif _health_err.kind != "not_deployed":
+                await _emit_abort(resp, f"Could not verify the existing cloud node list: {_health_err}. "
+                                        "The cloud image was not changed.")
+                return 1, ()
     try:
         _rec = await asyncio.to_thread(node_sync.reconcile_baked_with_cloud, cfg)
     except node_sync.DeployBlocked as _blk:

@@ -807,10 +807,10 @@ def reconcile_baked_with_cloud(cfg: dict) -> Reconciled:
             return Reconciled([], [])
         if not read_baked_nodes():
             raise DeployBlocked(
-                f"读不到云端装了哪些自定义节点({e}),而本机节点清单是空的 —— 多半是插件重装丢了"
-                f"清单,继续部署可能清空云端全部自定义节点,已中止。\n"
-                f"处理:检查网络 / bridge key 后重试。若确认云端不需要任何自定义节点,可在 Modal 控制台"
-                f"删掉这个 app 再部署(会按全新部署处理)。") from None
+                f"Cannot read the cloud custom-node list ({e}), and the local node manifest is empty. "
+                f"Deployment stopped to avoid removing custom nodes from the cloud image.\n"
+                f"Restore the local manifest from a backup, or confirm the cloud app has no custom nodes "
+                f"before deploying it as a new app.") from None
         return Reconciled([], [], unchecked=f"读不到云端节点清单:{e};云端独有的节点也没法并回")
     local = read_baked_nodes()
     # 云端报了名字却没报版本(云端早于 0.8.48,或它读清单失败):同名节点一个都比不了。
@@ -1637,7 +1637,7 @@ _SECRET_KEYS = {
 def secret_upsert_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
                       bridge_key: str = "", comfy_api_key: str = "",
                       aigc_base_url: str = "", aigc_bypass_secret: str = "",
-                      clear=()) -> list[str]:
+                      clear=(), require_update: bool = False) -> list[str]:
     """合并语义地写 Modal Secret 的命令(参数顺序与 secret_create_cmd 相同,可直接替换)。
 
     非空的值写入(覆盖同名键);空值 = 这次没提供,Secret 里原有的键**保持不动**;
@@ -1661,8 +1661,9 @@ def secret_upsert_cmd(cfg: dict, hf_token: str = "", civitai_token: str = "",
     app_name = cfg.get("modal_app_name", "comfyui-bridge")
     pairs = [f"{k}={v}" for f, v in values.items() if v for k in _SECRET_KEYS[f]]
     clears = [f"--clear={k}" for f in sorted(clear) if not values.get(f) for k in _SECRET_KEYS[f]]
+    flags = ["--require-update"] if require_update else []
     return [sys.executable, "-c", _SECRET_UPSERT_BOOT, str(_HERE), "secret-upsert",
-            f"{app_name}-secrets", *pairs, *clears]
+            f"{app_name}-secrets", *flags, *pairs, *clears]
 
 
 # secret_upsert_cmd 的子进程入口。⚠ 不能是 `python node_sync.py …`(2026-10-05 深度 review 第二轮):
@@ -1687,7 +1688,10 @@ def _secret_upsert_main(argv: list[str], modal_mod=None) -> int:
         print("用法: python node_sync.py secret-upsert <secret 名> KEY=VALUE... [--clear=KEY ...]")
         return 2
     name, sets, clears = argv[0], {}, []
+    require_update = "--require-update" in argv[1:]
     for a in argv[1:]:
+        if a == "--require-update":
+            continue
         if a.startswith("--clear="):
             clears.append(a[len("--clear="):])
             continue
@@ -1699,6 +1703,10 @@ def _secret_upsert_main(argv: list[str], modal_mod=None) -> int:
     if modal_mod is None:
         import modal as modal_mod
     if not hasattr(modal_mod.Secret, "update"):
+        if require_update:
+            print("✗ This recovery requires modal.Secret.update (Modal SDK 1.3.5 or newer). "
+                  "The cloud Secret was not replaced.", flush=True)
+            return 2
         print("⚠ 本机 modal SDK 早于 1.3.5,没有 Secret.update —— 退回整份重建(--force):"
               "这次没给的键会被清掉。升级 SDK(pip install -U modal)后恢复合并更新。", flush=True)
         return subprocess.call([sys.executable, "-m", "modal", "secret", "create", "--force", name,

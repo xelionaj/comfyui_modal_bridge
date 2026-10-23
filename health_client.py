@@ -46,8 +46,11 @@ def interpret(status: int, body: str) -> dict:
     ⚠ 必须查状态码:401 的 body 也是合法 JSON({"error": ...}),无脑解析会把「key 错了」
       包装成「健康检查通过」—— 最误导的一类假阳性。"""
     if status == 401:
-        raise HealthUnavailable("unauthorized", "Modal /health 401 — bridge key 不对/缺失。"
-                                                "点 [Modal Setup] 重新部署会刷新 key")
+        raise HealthUnavailable(
+            "unauthorized",
+            "Modal /health returned 401: the cloud app rejected its bridge key. "
+            "This key is separate from the Modal Member API token.",
+        )
     if status == 404:
         raise HealthUnavailable("not_deployed", "Modal /health 404 — app 还没部署或已被删除")
     if 300 <= status < 400:
