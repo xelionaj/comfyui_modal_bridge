@@ -1947,8 +1947,9 @@ def _setup_routes():
         overwrite = body.get("overwrite", False)
         if not isinstance(url, str) or len(url) > 4096:
             raise _BadRequest("Paste a Hugging Face or Civitai model download URL.")
-        if not isinstance(model_type, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", model_type):
-            raise _BadRequest("Choose a valid ComfyUI model folder.")
+        if (not isinstance(model_type, str) or len(model_type) > 128
+                or not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", model_type)):
+            raise _BadRequest("Use a safe model folder path, such as checkpoints or SEEDVR2.")
         if not isinstance(filename, str) or len(filename) > 240:
             raise _BadRequest("Filename must be a plain file name (max 240 characters).")
         if not isinstance(overwrite, bool):
@@ -2006,16 +2007,20 @@ def _setup_routes():
                                 await _emit(resp, f"{message}{progress}\n")
                                 last_message = message
                             if status == "completed":
-                                try:
-                                    counts = await asyncio.to_thread(
-                                        _refresh_cloud_model_lists, cfg, {model_type})
-                                    await _emit(resp,
-                                                "Cloud model names added to local ComfyUI loader choices. "
-                                                "Refresh the browser page to update existing dropdowns.\n")
-                                except Exception as e:
-                                    await _emit(resp,
-                                                f"Download succeeded, but refreshing local model choices failed: "
-                                                f"{_one_line(e)}. Use Refresh cloud model list.\n")
+                                known_types = set(folder_paths.folder_names_and_paths) if folder_paths else set()
+                                if model_type in known_types:
+                                    try:
+                                        await asyncio.to_thread(
+                                            _refresh_cloud_model_lists, cfg, {model_type})
+                                        await _emit(resp,
+                                                    "Cloud model names added to local ComfyUI loader choices. "
+                                                    "Refresh the browser page to update existing dropdowns.\n")
+                                    except Exception as e:
+                                        await _emit(resp,
+                                                    f"Download succeeded, but refreshing local model choices failed: "
+                                                    f"{_one_line(e)}. Use Refresh cloud model list.\n")
+                                else:
+                                    await _emit(resp, "Saved to the requested custom folder in the Modal Volume.\n")
                                 return 0
                             if status == "failed":
                                 await _emit(resp, f"== ✗ Download failed: {_one_line(state.get('error') or message)} ==\n")

@@ -1624,7 +1624,8 @@ def download_model_endpoint(payload: dict):
     overwrite = payload.get("overwrite") is True
     if not isinstance(url, str) or len(url) > 4096:
         return JSONResponse({"error": "A model download URL is required (max 4096 characters)."}, status_code=400)
-    if not isinstance(model_type, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", model_type):
+    if (not isinstance(model_type, str) or len(model_type) > 128
+            or not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", model_type)):
         return JSONResponse({"error": "Invalid model folder."}, status_code=400)
     if filename is not None and not isinstance(filename, str):
         return JSONResponse({"error": "filename must be a plain file name."}, status_code=400)

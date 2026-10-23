@@ -1,0 +1,3 @@
+# One model per line: HTTPS URL<TAB>folder under /models<TAB>filename (optional)
+https://huggingface.co/owner/repo/resolve/main/seedvr2_model.safetensors	SEEDVR2	seedvr2_model.safetensors
+https://civitai.com/api/download/models/123456	checkpoints	checkpoint.safetensors

@@ -3113,11 +3113,16 @@ async function openDeployDialog() {
       <label style="${labelCss}">ComfyUI model folder</label>
       <select id="mb-dep-model-type" style="${inputCss}">
         ${["checkpoints", "diffusion_models", "unet", "text_encoders", "clip", "vae", "loras", "controlnet", "clip_vision", "upscale_models", "embeddings", "hypernetworks", "style_models", "audio_encoders", "background_removal", "classifiers", "datasets", "detection", "frame_interpolation", "geometry_estimation", "latent_upscale_models", "model_patches", "optical_flow", "photomaker", "gligen", "diffusers", "vae_approx", "pulid", "inpaint", "insightface", "onnx", "sams", "ultralytics"].map((x) => `<option value="${x}">${x}</option>`).join("")}
+        <option value="SEEDVR2">SEEDVR2 (custom folder)</option>
       </select>
       <label style="${labelCss}">Filename <span style="${hintCss}">(optional; inferred from download response)</span></label>
       <input id="mb-dep-model-filename" type="text" style="${inputCss}" placeholder="model.safetensors">
       <label style="display:flex;align-items:center;gap:7px;margin:0 0 10px;color:#ddd;"><input id="mb-dep-model-overwrite" type="checkbox"> Replace the file if it already exists</label>
       <button id="mb-dep-model-download" style="${btnPrimaryCss}">Download to Modal Volume</button>
+      <label style="${labelCss};margin-top:14px;">Download a list of models</label>
+      <div style="${noteCss}">One model per line: <code>URL[TAB]folder[TAB]filename</code>. Filename is optional. Example: <code>https://huggingface.co/owner/repo/resolve/main/model.safetensors[TAB]SEEDVR2[TAB]model.safetensors</code>. The folder is under <code>/models/</code> on the Modal Volume.</div>
+      <textarea id="mb-dep-model-list" rows="5" style="${inputCss};font-family:monospace;resize:vertical;" placeholder="https://huggingface.co/owner/repo/resolve/main/model.safetensors&#9;SEEDVR2&#9;model.safetensors&#10;https://civitai.com/api/download/models/123456&#9;checkpoints&#9;checkpoint.safetensors"></textarea>
+      <button id="mb-dep-model-list-download" style="${btnPrimaryCss};margin-top:6px;">Download model list to Modal</button>
       <button id="mb-dep-model-refresh" style="${btnGhostCss}margin-left:6px;">Refresh cloud model list</button>
       <div id="mb-dep-model-status" style="margin:8px 0;color:#9aa;font-size:12px;"></div>
       <pre id="mb-dep-model-log" style="display:none;max-height:180px;overflow:auto;white-space:pre-wrap;background:#111;padding:8px;border-radius:6px;color:#ddd;"></pre>
@@ -3454,6 +3459,7 @@ async function openDeployDialog() {
   }
 
   const downloadModelBtn = panel.querySelector("#mb-dep-model-download");
+  const downloadModelListBtn = panel.querySelector("#mb-dep-model-list-download");
   const refreshModelBtn = panel.querySelector("#mb-dep-model-refresh");
   const downloadModelStatus = panel.querySelector("#mb-dep-model-status");
   const downloadModelLog = panel.querySelector("#mb-dep-model-log");
@@ -3508,6 +3514,51 @@ async function openDeployDialog() {
       downloadModelStatus.textContent = String(e.message || e);
     } finally {
       downloadModelBtn.disabled = false;
+    }
+  };
+  downloadModelListBtn.onclick = async () => {
+    const lines = panel.querySelector("#mb-dep-model-list").value.split(/\r?\n/)
+      .map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+    if (!lines.length) { downloadModelStatus.textContent = "Add at least one model row first."; return; }
+    const items = [];
+    for (let i = 0; i < lines.length; i++) {
+      const cols = lines[i].split("\t").map((x) => x.trim());
+      if (cols.length < 2 || cols.length > 3 || !cols[0] || !cols[1]) {
+        downloadModelStatus.style.color = "#ef4444";
+        downloadModelStatus.textContent = `Line ${i + 1}: expected URL, folder, and optional filename separated by tabs.`;
+        return;
+      }
+      items.push({ url: cols[0], model_type: cols[1], filename: cols[2] || "" });
+    }
+    const overwrite = panel.querySelector("#mb-dep-model-overwrite").checked;
+    if (overwrite && !confirm(`Replace matching files in the Modal Volume for up to ${items.length} listed model(s)?`)) return;
+    downloadModelListBtn.disabled = true;
+    downloadModelLog.style.display = "block";
+    downloadModelLog.textContent = "";
+    const log = (line) => { downloadModelLog.textContent += line + "\n"; downloadModelLog.scrollTop = downloadModelLog.scrollHeight; downloadModelStatus.textContent = line; };
+    const failures = [];
+    downloadModelStatus.style.color = "#9aa";
+    try {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        log(`== Model ${i + 1}/${items.length}: ${item.filename || item.url} → /models/${item.model_type} ==`);
+        try {
+          const rc = await streamPost("/modal_bridge/download_model", { ...item, overwrite }, log);
+          if (rc !== 0) failures.push(`${i + 1}: ${item.filename || item.url}`);
+        } catch (e) {
+          failures.push(`${i + 1}: ${String(e.message || e)}`);
+          log(`✗ ${String(e.message || e)}`);
+        }
+      }
+      if (failures.length) {
+        downloadModelStatus.style.color = "#ef4444";
+        downloadModelStatus.textContent = `${items.length - failures.length}/${items.length} completed; ${failures.length} failed. See log and retry failed rows.`;
+      } else {
+        downloadModelStatus.style.color = "#34d399";
+        downloadModelStatus.textContent = `All ${items.length} model download(s) completed in the Modal Volume.`;
+      }
+    } finally {
+      downloadModelListBtn.disabled = false;
     }
   };
 
