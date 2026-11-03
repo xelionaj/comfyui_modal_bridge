@@ -617,6 +617,7 @@ class BridgeClient:
         # loader stores the selected filename in the LoadAudioState JSON input.
         "PixaromaLoadImage": ("image",),
         "PixaromaLoadImageMini": ("image",),
+        "PixaromaLoadVideo": ("video",),
         "PixaromaLoadVideoFrame": ("video",),
         "PixaromaLoadAudio": ("LoadAudioState",),
         "LoadVideo": ("file",),

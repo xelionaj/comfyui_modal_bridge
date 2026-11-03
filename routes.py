@@ -579,6 +579,7 @@ _INPUT_FILE_NODES = {
     # inputs; LoadAudio stores its selected filename in LoadAudioState JSON.
     "PixaromaLoadImage": ("image",),
     "PixaromaLoadImageMini": ("image",),
+    "PixaromaLoadVideo": ("video",),
     "PixaromaLoadVideoFrame": ("video",),
     "PixaromaLoadAudio": ("LoadAudioState",),
     "LoadVideo": ("file",),
