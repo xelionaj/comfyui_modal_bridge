@@ -575,6 +575,12 @@ _INPUT_FILE_NODES = {
     "LoadImage": ("image",),
     "LoadImageMask": ("image",),
     "LoadImageOutput": ("image",),
+    # Pixaroma loaders: the image and video loaders use ordinary filename
+    # inputs; LoadAudio stores its selected filename in LoadAudioState JSON.
+    "PixaromaLoadImage": ("image",),
+    "PixaromaLoadImageMini": ("image",),
+    "PixaromaLoadVideoFrame": ("video",),
+    "PixaromaLoadAudio": ("LoadAudioState",),
     "LoadVideo": ("file",),
     "LoadAudio": ("audio",),
 }
@@ -601,6 +607,15 @@ def _extract_input_file_name(cls: str, ins: dict) -> str | None:
     keys = _INPUT_FILE_NODES.get(cls)
     if not keys:
         return None
+    if cls == "PixaromaLoadAudio":
+        # Pixaroma keeps the filename inside a frontend-injected JSON state
+        # input instead of a normal file widget.
+        try:
+            state = json.loads(ins.get("LoadAudioState") or "{}")
+        except (TypeError, ValueError):
+            state = {}
+        filename = state.get("file") if isinstance(state, dict) else None
+        return filename if isinstance(filename, str) and filename else None
     # "filename" 是给自定义节点的兜底;连线形态是 ["3", 0] 这样的 list,必须判 str 跳过。
     for k in (*keys, "filename"):
         v = ins.get(k)

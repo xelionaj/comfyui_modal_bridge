@@ -613,9 +613,30 @@ class BridgeClient:
         "LoadImage": ("image",),
         "LoadImageMask": ("image",),
         "LoadImageOutput": ("image",),
+        # Pixaroma image/video loaders use regular filename inputs. Its audio
+        # loader stores the selected filename in the LoadAudioState JSON input.
+        "PixaromaLoadImage": ("image",),
+        "PixaromaLoadImageMini": ("image",),
+        "PixaromaLoadVideoFrame": ("video",),
+        "PixaromaLoadAudio": ("LoadAudioState",),
         "LoadVideo": ("file",),
         "LoadAudio": ("audio",),
     }
+
+    @staticmethod
+    def _input_file_name(class_type: str, inputs: dict) -> str | None:
+        if class_type == "PixaromaLoadAudio":
+            try:
+                state = json.loads(inputs.get("LoadAudioState") or "{}")
+            except (TypeError, ValueError):
+                state = {}
+            filename = state.get("file") if isinstance(state, dict) else None
+            return filename if isinstance(filename, str) and filename else None
+        keys = BridgeClient._INPUT_FILE_NODES.get(class_type)
+        if not keys:
+            return None
+        return next((inputs[k] for k in (*keys, "filename")
+                     if isinstance(inputs.get(k), str) and inputs[k]), None)
 
     @staticmethod
     def pack_input_images(workflow: dict, search_dirs: list[str]) -> list[dict]:
@@ -628,13 +649,9 @@ class BridgeClient:
         for node in (workflow or {}).values():
             if not isinstance(node, dict):
                 continue
-            keys = BridgeClient._INPUT_FILE_NODES.get(node.get("class_type"))
-            if not keys:
-                continue
             ins = node.get("inputs") or {}
             # "filename" 是给自定义节点的兜底;连线形态是 ["3", 0] 这样的 list,必须判 str 跳过。
-            n = next((ins[k] for k in (*keys, "filename")
-                      if isinstance(ins.get(k), str) and ins[k]), None)
+            n = BridgeClient._input_file_name(node.get("class_type"), ins)
             if n and n not in names:
                 names.append(n)
         for n in names:
