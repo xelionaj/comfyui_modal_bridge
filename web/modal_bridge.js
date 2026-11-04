@@ -3103,6 +3103,9 @@ async function openDeployDialog() {
       </select>
       <div id="mb-dep-tiermsg" style="margin:0 0 6px;color:#10b981;font-size:12px;"></div>
       <div style="${noteCss}margin-top:0;cursor:help;" title="${t("dlg.gpu.note_full")}">${t("dlg.gpu.note")}</div>
+      <label style="${labelCss};margin-top:12px;">Worker timeout (seconds) <span style="${hintCss}">(60–86400; default 1200)</span></label>
+      <input id="mb-dep-worker-timeout" type="number" style="${inputCss}" min="60" max="86400" step="60" value="${Number(cfg.worker_timeout_sec) || 1200}">
+      <div style="${noteCss}margin-top:0;">Maximum execution time per job. Queue and cold-start time are excluded. Redeploy to apply.</div>
     </div>
 
     <div style="${groupCss}">
@@ -3575,6 +3578,7 @@ async function openDeployDialog() {
       // 即时保存)。各档具体绑哪张卡由 cheap_gpu / default_gpu / top_gpu 决定,那才是部署期
       // 固定的(@app.cls 的 gpu= 参数),要换卡型得改 config.json 再部署。
       gpu_tier: tierSel.value,
+      worker_timeout_sec: Number(panel.querySelector("#mb-dep-worker-timeout").value),
       comfy_api_key: panel.querySelector("#mb-dep-comfy").value.trim(),
       hf_token: panel.querySelector("#mb-dep-hf-token").value.trim(),
       civitai_token: panel.querySelector("#mb-dep-civitai-token").value.trim(),
@@ -3590,6 +3594,11 @@ async function openDeployDialog() {
     };
     // token_secret 留空 = 沿用已存的(/config 不再回显它);只有填了才校验格式
     const secretOk = payload.token_secret === "" ? cfg.has_token_secret : payload.token_secret.startsWith("as-");
+    if (!Number.isInteger(payload.worker_timeout_sec) || payload.worker_timeout_sec < 60 || payload.worker_timeout_sec > 86400) {
+      statusEl.textContent = "Worker timeout must be an integer from 60 to 86400 seconds (24 hours).";
+      statusEl.style.color = "#f87171";
+      return;
+    }
     if (!payload.token_id.startsWith("ak-") || !secretOk || !payload.workspace) {
       statusEl.textContent = cfg.has_token_secret ? t("dep.fill_saved") : t("dep.fill_all");
       statusEl.style.color = "#f87171";

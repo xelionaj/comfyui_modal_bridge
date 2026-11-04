@@ -151,6 +151,8 @@ MCP 本地模式就是这么做的。
 | `/modal_bridge/deploy` | POST | 重新部署云端 app(drain 语义:在跑的任务在旧版本上跑完)。workspace / app 名不合规、或 AIGC 地址不是 `https://` 时返回 rc=2;部署后 `/health` 仍 404 判失败 |
 | `/modal_bridge/list_nodes` | GET | 云端镜像当前的 custom_node 清单 |
 
+部署请求可选 `worker_timeout_sec`(整数秒,60–86400;默认 1200)。它限制单个 worker 任务执行时间,不含排队;修改后要重新部署才生效。Modal Function 的平台上限为 24 小时。
+
 ## 状态与配置
 
 | 端点 | 方法 | 说明 |

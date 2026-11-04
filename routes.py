@@ -1169,6 +1169,7 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
     volume_name = (body.get("volume_name") or cfg.get("modal_volume_name") or "comfyui-bridge-models").strip()
     default_gpu = (body.get("default_gpu") or cfg.get("default_gpu") or "H100").strip()
     scaledown = int(body.get("scaledown_window") or cfg.get("scaledown_window") or 2)
+    worker_timeout_sec = int(body.get("worker_timeout_sec") or cfg.get("worker_timeout_sec") or 1200)
     # ⚠ 下面 secret create 用的是 --force,会**整份替换** Modal Secret。HF / Civitai token
     #   以前只从请求体取、从不持久化,而面板根本不发这两个字段 —— 于是用 deploy.py
     #   --hf-token 配过的 token,点一次「推送到云端」就被抹掉,节点下 gated 权重静默失败。
@@ -1221,6 +1222,7 @@ async def _deploy_locked(resp: web.StreamResponse, body: dict, token_id: str,
         "modal_workspace": workspace,
         "modal_volume_name": volume_name,
         "scaledown_window": scaledown,
+        "worker_timeout_sec": worker_timeout_sec,
         "default_gpu": default_gpu,
         # GPU 档位是运行时路由(改它本不必部署,前端切换时已即时存过);这里一并收下,
         # 只是让「部署」也能兜住一次,避免即时保存失败时前后端看到的档位不一致。
@@ -2561,7 +2563,7 @@ def _setup_routes():
         GUI 一键部署/重新部署:检查 Manager 已装的 modal → 建 secret → modal deploy → 写 config。
         全程在 ComfyUI 进程里,零终端。stream 回传日志,最后 __DEPLOY_DONE__ rc=<code>。
         body: {token_id, token_secret, workspace, hf_token?, civitai_token?,
-               app_name?, volume_name?, default_gpu?, scaledown_window?,
+               app_name?, volume_name?, default_gpu?, scaledown_window?, worker_timeout_sec?,
                comfy_api_key?, aigc_studio_base_url?, aigc_bypass_secret?}
         """
         # 字段类型在 prepare 之前校验完(深度 review):以前 scaledown_window 传个 "abc"
@@ -2575,6 +2577,12 @@ def _setup_routes():
         if _sd not in (None, "") and (isinstance(_sd, bool) or not isinstance(_sd, (int, str))
                                       or not str(_sd).strip().isdigit()):
             raise _BadRequest("scaledown_window 必须是非负整数(秒)")
+        _wt = body.get("worker_timeout_sec")
+        if _wt not in (None, ""):
+            if isinstance(_wt, bool) or not isinstance(_wt, (int, str)) or not str(_wt).strip().isdigit():
+                raise _BadRequest("worker_timeout_sec 必须是整数秒(60–86400)")
+            if not 60 <= int(_wt) <= 86400:
+                raise _BadRequest("worker_timeout_sec 必须在 60–86400 秒之间(Modal 上限 24 小时)")
         if body.get("auto_downgrade") is not None and not isinstance(body.get("auto_downgrade"), bool):
             raise _BadRequest("auto_downgrade 必须是 boolean")
         if (body.get("gpu_tier") or "").strip().lower() not in ("", "auto", "cheap", "primary", "top"):
