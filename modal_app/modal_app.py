@@ -66,9 +66,9 @@ try:
     bridge_secret = modal.Secret.from_name(SECRET_NAME)
 except Exception:
     bridge_secret = modal.Secret.from_dict({})
-# The downloader can use a separate Civitai Secret owned by the account. Keep it
-# separate from the bridge-managed Secret so deployment does not overwrite it.
-civitai_secret = modal.Secret.from_name("civitai")
+# CIVITAI_TOKEN is upserted into the same bridge-managed Secret by deploy.py.
+# Attaching a second, account-specific Secret here made fresh deployments fail
+# unless users had manually created a Secret named "civitai".
 
 job_state = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
 model_download_state = modal.Dict.from_name(f"{APP_NAME}-model-downloads", create_if_missing=True)
@@ -1465,7 +1465,7 @@ def _download_state_update(download_id: str, **values) -> None:
 
 
 @app.function(image=cuda_image, volumes={"/comfy-volume": models_vol},
-              secrets=[bridge_secret, civitai_secret], timeout=21600, max_containers=1,
+              secrets=[bridge_secret], timeout=21600, max_containers=1,
               scaledown_window=SCALEDOWN)
 @modal.concurrent(max_inputs=1)
 def model_download_job(url: str, provider: str, model_type: str, filename: str,
